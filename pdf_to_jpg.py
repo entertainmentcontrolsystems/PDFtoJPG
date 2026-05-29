@@ -82,72 +82,6 @@ def output_path_for(pdf_path: Path, src_root: Path, dst_root: Path,
     return dst_root / parent / filename
 
 
-def convert_pdf(pdf_path: Path, src_root: Path, dst_root: Path,
-                dpi: int, quality: int, log_fn, use_streaming: bool = False):
-    """
-    Convert one PDF file. Returns (success, pages_written, error_msg).
-
-    When use_streaming=True, renders 10 pages at a time to limit memory
-    for very large PDFs. Otherwise renders all pages at once (faster but
-    uses more RAM).
-    """
-    try:
-        if not use_streaming:
-            images = convert_from_path(str(pdf_path), dpi=dpi)
-            total = len(images)
-            written = 0
-            for i, img in enumerate(images, start=1):
-                out = output_path_for(pdf_path, src_root, dst_root, i, total)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(out), "JPEG", quality=quality, optimize=True)
-                written += 1
-                log_fn(f"  ✓ {out.relative_to(dst_root)}")
-            return True, written, None
-
-        # ── Streaming mode: render in batches of 10 pages ──────────────────
-        written = 0
-        page = 1
-        # Get total page count first
-        try:
-            import subprocess
-            import re
-            result = subprocess.run(
-                ["pdfinfo", str(pdf_path)], capture_output=True, text=True, timeout=30
-            )
-            match = re.search(r"Pages:\s+(\d+)", result.stdout)
-            total_pages = int(match.group(1)) if match else 999
-        except Exception:
-            total_pages = 999  # unknown — will discover as we go
-
-        while True:
-            batch = convert_from_path(
-                str(pdf_path), dpi=dpi,
-                first_page=page, last_page=page + 9
-            )
-            if not batch:
-                break
-
-            for img in batch:
-                if page > total_pages:
-                    total_pages = page  # discovered actual page count
-                out = output_path_for(pdf_path, src_root, dst_root, page, total_pages)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(out), "JPEG", quality=quality, optimize=True)
-                written += 1
-                log_fn(f"  ✓ {out.relative_to(dst_root)}")
-                page += 1
-
-            if len(batch) < 10:
-                break
-
-        return True, written, None
-
-    except (PDFPageCountError, PDFSyntaxError) as e:
-        return False, 0, str(e)
-    except Exception as e:
-        return False, 0, str(e)
-
-
 class ConvertTask:
     """Lightweight task object for parallel dispatch."""
     def __init__(self, pdf_path, src_root, dst_root, dpi, quality, streaming):
@@ -172,16 +106,18 @@ class App(tk.Tk):
         self._build_ui()
         self._running = False
         self._cancel_flag = threading.Event()
+        self._executor = None
 
-        # Enable drag-and-drop for folders and PDF files
+        # Enable drag-and-drop for folders and PDF files.
+        # tkinterdnd2 is required for cross-platform drag-and-drop;
+        # fall back gracefully if not installed.
         try:
             from tkinterdnd2 import DND_FILES, TkinterDnD
-            # If tkinterdnd2 is available, re-initialize with DnD support
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+            self._dnd_ok = True
         except ImportError:
-            pass  # drag-and-drop works via tk built-in on macOS/Windows anyway
-
-        self.drop_target_register(tk.DND_FILES)
-        self.dnd_bind("<<Drop>>", self._on_drop)
+            self._dnd_ok = False  # no drag-and-drop available
 
     # ── layout ──────────────────────────────────────────────────
 
@@ -367,15 +303,44 @@ class App(tk.Tk):
     # ── log helpers ──────────────────────────────────────────────
 
     def _log(self, msg: str):
+        """Thread-safe log — always executes on the main thread."""
+        self.after(0, self._log_mainthread, msg)
+
+    def _log_mainthread(self, msg: str):
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def _clear_log(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+    def _set_status(self, msg: str):
+        """Thread-safe status bar update."""
+        self.after(0, self._set_status_mainthread, msg)
+
+    def _set_status_mainthread(self, msg: str):
+        self.status_var.set(msg)
+
+    def _update_progress(self, value: int, maximum: int | None = None):
+        """Thread-safe progress bar update."""
+        self.after(0, self._update_progress_mainthread, value, maximum)
+
+    def _update_progress_mainthread(self, value: int, maximum: int | None):
+        if maximum is not None:
+            self.progress["maximum"] = maximum
+        self.progress["value"] = value
+
+    def _set_buttons(self, *, scan: str | None = None,
+                     convert: str | None = None,
+                     cancel: str | None = None):
+        """Thread-safe button state update ("normal" or "disabled")."""
+        self.after(0, self._set_buttons_mainthread, scan, convert, cancel)
+
+    def _set_buttons_mainthread(self, scan, convert, cancel):
+        if scan is not None:
+            self.scan_btn.configure(state=scan)
+        if convert is not None:
+            self.convert_btn.configure(state=convert)
+        if cancel is not None:
+            self.cancel_btn.configure(state=cancel)
 
     def _save_log(self):
         log_text = self.log.get("1.0", "end-1c")
@@ -428,7 +393,7 @@ class App(tk.Tk):
 
         if total == 0:
             self._log("No PDF files found in the source folder.")
-            self.status_var.set("No PDFs found.")
+            self._set_status("No PDFs found.")
             return
 
         self._log(f"Found {total} PDF file(s). Counting pages…\n")
@@ -439,6 +404,10 @@ class App(tk.Tk):
         total_size_mb = 0.0
 
         for i, pdf in enumerate(pdfs, start=1):
+            if self._cancel_flag.is_set():
+                self._set_status("Scan cancelled.")
+                return
+
             size_mb = pdf.stat().st_size / (1024 * 1024)
             total_size_mb += size_mb
             pages = count_pdf_pages(pdf)
@@ -446,9 +415,8 @@ class App(tk.Tk):
             rel = pdf.relative_to(src_root)
             self._log(f"{pages:>5}p  {str(rel):<60}  {size_mb:>6.1f} MB")
 
-            # Show progress on status bar
             if i % 10 == 0:
-                self.status_var.set(f"Scanning… {i}/{total} ({total_pages} pages found so far)")
+                self._set_status(f"Scanning… {i}/{total} ({total_pages} pages found so far)")
 
         self._log("-" * 90)
         avg_pages = total_pages / total if total > 0 else 0
@@ -458,7 +426,7 @@ class App(tk.Tk):
                   f"~{total_size_mb * 2:.0f}-{total_size_mb * 5:.0f} MB of JPGs")
         self._log("\nReady to convert. Click 'Convert All PDFs' to begin.")
 
-        self.status_var.set(
+        self._set_status(
             f"Scanned: {total} PDFs, {total_pages} pages total. Ready to convert."
         )
 
@@ -516,29 +484,26 @@ class App(tk.Tk):
         )
         thread.start()
 
+    def _clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
     def _check_poppler(self) -> bool:
         """Check if Poppler is installed and accessible."""
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["pdftoppm", "-v"], capture_output=True, timeout=5
-            )
-            return result.returncode == 0 or b"pdftoppm" in result.stderr
-        except FileNotFoundError:
-            pass
-        try:
-            result = subprocess.run(
-                ["pdfinfo", "-v"], capture_output=True, timeout=5
-            )
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
-        return False
+        import shutil
+        return shutil.which("pdftoppm") is not None or shutil.which("pdfinfo") is not None
 
     def _cancel(self):
         self._cancel_flag.set()
         self._running = False
-        self.status_var.set("Cancelling…")
+        self._set_status("Cancelling…")
+        # Shut down executor immediately — don't wait for queued futures
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     def _run(self, src_root: Path, dst_root: Path, dpi: int, quality: int, workers: int):
         pdfs = list(find_pdfs(src_root))
@@ -549,7 +514,7 @@ class App(tk.Tk):
             self._done("No PDFs found.")
             return
 
-        # ── Count total pages for accurate progress ───────────────────────
+        # ── Count total pages for accurate progress ───────────────────
         self._log(f"Found {total} PDF file(s). Counting pages…")
         pdf_info = []
         total_pages = 0
@@ -559,45 +524,38 @@ class App(tk.Tk):
             pdf_info.append((pdf, pages, size_mb))
             total_pages += pages
 
-        # Determine if streaming is needed (PDFs > 50 pages)
-        use_streaming = any(pages > 50 for _, pages, _ in pdf_info)
-
-        self._log(f"Total: {total} PDFs, {total_pages} pages "
-                  f"{'(streaming mode for large PDFs)' if use_streaming else ''}\n")
-
-        self.progress["maximum"] = total_pages
-        self.progress["value"]   = 0
+        self._log(f"Total: {total} PDFs, {total_pages} pages\n")
+        self._update_progress(0, maximum=total_pages)
 
         ok_count  = 0
         err_count = 0
         jpg_count = 0
+        page_count = 0
         _page_lock = threading.Lock()
-        _log_lock  = threading.Lock()
 
         def log_threadsafe(msg: str):
-            with _log_lock:
-                self._log(msg)
+            self._log(msg)
 
-        def log_status(msg: str):
-            self.status_var.set(msg)
+        # ── Parallel conversion ──────────────────────────────────────
+        cpu_count = multiprocessing.cpu_count()
+        actual_workers = max(1, min(workers, total, cpu_count, 8))
 
-        # ── Parallel conversion ──────────────────────────────────────────
-        actual_workers = max(1, min(workers, total))
-
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        self._executor = ThreadPoolExecutor(max_workers=actual_workers)
+        try:
             futures = {}
             for pdf, pages, _size in pdf_info:
                 if self._cancel_flag.is_set():
                     break
                 task = ConvertTask(pdf, src_root, dst_root, dpi, quality,
-                                   use_streaming and pages > 50)
-                fut = executor.submit(
+                                   pages > 50)
+                fut = self._executor.submit(
                     _convert_and_log, task, log_threadsafe
                 )
                 futures[fut] = (pdf, pages)
 
             for fut in as_completed(futures):
                 if self._cancel_flag.is_set():
+                    self._executor.shutdown(wait=False, cancel_futures=True)
                     break
 
                 pdf, pages_in_pdf = futures[fut]
@@ -617,12 +575,17 @@ class App(tk.Tk):
                         err_count += 1
                         log_threadsafe(f"✗ {rel} — ERROR: {err}")
 
-                    self.progress["value"] += pages_in_pdf
-                    progress_pct = int(self.progress["value"] / total_pages * 100)
-                    log_status(
-                        f"Converting… {ok_count + err_count}/{total} PDFs "
-                        f"({self.progress['value']}/{total_pages} pages, {progress_pct}%)"
-                    )
+                    page_count += pages_in_pdf
+                    if total_pages > 0:
+                        progress_pct = int(page_count / total_pages * 100)
+                        self._update_progress(page_count)
+                        self._set_status(
+                            f"Converting… {ok_count + err_count}/{total} PDFs "
+                            f"({page_count}/{total_pages} pages, {progress_pct}%)"
+                        )
+        finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
 
         if not self._cancel_flag.is_set():
             summary = (f"\nDone! {ok_count} PDF(s) converted → {jpg_count} JPG(s). "
@@ -635,10 +598,8 @@ class App(tk.Tk):
 
     def _done(self, msg: str):
         self._running = False
-        self.status_var.set(msg)
-        self.convert_btn.configure(state="normal")
-        self.cancel_btn.configure(state="disabled")
-        self.scan_btn.configure(state="normal")
+        self._set_status(msg)
+        self._set_buttons(scan="normal", convert="normal", cancel="disabled")
 
 
 def _convert_and_log(task: ConvertTask, log_fn) -> tuple:
@@ -663,29 +624,31 @@ def _convert_and_log(task: ConvertTask, log_fn) -> tuple:
         # ── Streaming mode for large PDFs ────────────────────────────────
         written = 0
         page = 1
+        import subprocess
+        import re
+        total_pages = 999  # fallback — bounded loop prevents runaway
         try:
-            import subprocess
-            import re
             result = subprocess.run(
                 ["pdfinfo", str(task.pdf_path)], capture_output=True, text=True, timeout=30
             )
             match = re.search(r"Pages:\s+(\d+)", result.stdout)
-            total_pages = int(match.group(1)) if match else 999
+            if match:
+                total_pages = int(match.group(1))
         except Exception:
-            total_pages = 999
+            pass  # use fallback
 
-        while True:
+        while page <= total_pages:
+            last = min(page + 9, total_pages)
             batch = convert_from_path(
                 str(task.pdf_path), dpi=task.dpi,
-                first_page=page, last_page=page + 9,
+                first_page=page, last_page=last,
             )
             if not batch:
                 break
 
             for img in batch:
-                if page > total_pages:
-                    total_pages = page
-                out = output_path_for(task.pdf_path, task.src_root, task.dst_root, page, total_pages)
+                out = output_path_for(task.pdf_path, task.src_root, task.dst_root,
+                                     page, total_pages)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 img.save(str(out), "JPEG", quality=task.quality, optimize=True)
                 written += 1
