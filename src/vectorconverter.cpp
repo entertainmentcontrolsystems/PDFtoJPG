@@ -72,9 +72,10 @@ bool VectorConverter::runPdftocairo(const QString &pdfPath,
     args << "-svg";                    // SVG output (vector-preserving)
     args << "-f" << QString::number(firstPage);
     args << "-l" << QString::number(lastPage);
-    args << "-singlefile";             // One SVG per file, not page-N.svg
+    // Note: -singlefile is NOT supported with -svg output.
+    // pdftocairo adds .svg extension to the output path.
     args << pdfPath;
-    args << outputPath;                // Output path (without extension)
+    args << outputPath;                // Output base (pdftocairo appends .svg)
 
     QProcess proc;
     proc.setProcessChannelMode(QProcess::MergedChannels);
@@ -137,13 +138,8 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
                 continue;
             }
 
-            // pdftocairo -svg -f N -l N -singlefile input.pdf output_path
-            // Note: pdftocairo appends .svg to the output path
-            // So we pass the path without .svg extension
-            QString outBase = outPath;
-            outBase.chop(4);  // remove ".svg"
-
-            if (runPdftocairo(pdfPath, outBase, pageIdx + 1, pageIdx + 1)) {
+            // pdftocairo -svg does NOT add .svg extension, so pass the full path
+            if (runPdftocairo(pdfPath, outPath, pageIdx + 1, pageIdx + 1)) {
                 pagesWritten++;
             } else {
                 qWarning() << "pdftocairo failed for page" << pageIdx;
@@ -163,10 +159,7 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
         int firstPage = pages.first() + 1;
         int lastPage = pages.last() + 1;
 
-        QString outBase = outPath;
-        outBase.chop(4);
-
-        if (runPdftocairo(pdfPath, outBase, firstPage, lastPage)) {
+        if (runPdftocairo(pdfPath, outPath, firstPage, lastPage)) {
             pagesWritten = pages.size();
         }
     }
@@ -238,11 +231,7 @@ void VectorConverter::convertPdfToDxf(const QString &pdfPath,
         QString tempSvg = QDir::temp().absoluteFilePath(
             QString("ecs_pdf_%1_%2.svg").arg(fi.baseName()).arg(pageIdx));
 
-        // pdftocairo writes .svg, so pass path without extension
-        QString svgBase = tempSvg;
-        svgBase.chop(4);
-
-        if (!runPdftocairo(pdfPath, svgBase, pageIdx + 1, pageIdx + 1)) {
+        if (!runPdftocairo(pdfPath, tempSvg, pageIdx + 1, pageIdx + 1)) {
             qWarning() << "pdftocairo failed for page" << pageIdx;
             continue;
         }
