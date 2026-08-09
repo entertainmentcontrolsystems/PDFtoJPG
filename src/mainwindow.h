@@ -42,6 +42,7 @@ private slots:
     void onPageProgress(int fileIndex, int pageIndex, int totalPages, int percent);
     void onFileDone(int fileIndex, bool success, int pagesWritten, int pagesFailed, const QString &message);
     void onAllDone(const ConversionResult &result);
+    void updateEstimate();
 
 private:
     void buildUi();
@@ -84,6 +85,7 @@ private:
     QLineEdit *m_pageRangeEdit;
     QProgressBar *m_progressBar;
     QLabel *m_statusLabel;
+    QLabel *m_estimateLabel;
     QPushButton *m_convertBtn;
     QPushButton *m_cancelBtn;
     QPushButton *m_clearBtn;

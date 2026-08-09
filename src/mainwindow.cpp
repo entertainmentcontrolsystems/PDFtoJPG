@@ -177,6 +177,7 @@ void MainWindow::buildUi()
     m_dpiSpin->setValue(150);
     m_dpiSpin->setSingleStep(50);
     m_dpiSpin->setMinimumWidth(100);
+    connect(m_dpiSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &MainWindow::updateEstimate);
     outputLayout->addWidget(m_dpiSpin, 2, 1);
 
     // Quality
@@ -187,6 +188,7 @@ void MainWindow::buildUi()
     m_qualitySpin->setValue(90);
     m_qualitySpin->setSingleStep(5);
     m_qualitySpin->setMinimumWidth(100);
+    connect(m_qualitySpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &MainWindow::updateEstimate);
     outputLayout->addWidget(m_qualitySpin, 3, 1);
 
     // Page range
@@ -209,6 +211,11 @@ void MainWindow::buildUi()
     m_openWhenDoneCheck = new QCheckBox("Open output folder when done");
     m_openWhenDoneCheck->setChecked(true);
     outputLayout->addWidget(m_openWhenDoneCheck, 8, 0, 1, 3);
+
+    // ── Size estimate ──
+    m_estimateLabel = new QLabel("Estimate: —");
+    m_estimateLabel->setStyleSheet("color: gray; font-size: 11px; padding-top: 4px;");
+    outputLayout->addWidget(m_estimateLabel, 9, 0, 1, 3);
 
     mainLayout->addWidget(outputGroup);
 
@@ -313,6 +320,8 @@ void MainWindow::onFormatChanged(int index)
     m_dpiLabel->setVisible(isRaster);
     m_qualitySpin->setVisible(isRaster && (fmt == OutputFormat::JPEG || fmt == OutputFormat::WebP));
     m_qualityLabel->setVisible(isRaster && (fmt == OutputFormat::JPEG || fmt == OutputFormat::WebP));
+
+    updateEstimate();
 }
 
 void MainWindow::scanPdfs(const QString &path)
@@ -341,6 +350,141 @@ void MainWindow::updateFileList()
     int count = m_pdfFiles.size();
     m_fileCountLabel->setText(count == 0 ? "No files" :
                               QString("%1 file%2").arg(count).arg(count == 1 ? "" : "s"));
+    updateEstimate();
+}
+
+void MainWindow::updateEstimate()
+{
+    if (m_pdfFiles.isEmpty()) {
+        m_estimateLabel->setText("Estimate: —");
+        return;
+    }
+
+    auto fmt = static_cast<OutputFormat>(m_formatCombo->currentData().toInt());
+
+    if (!PdfConverter::isRaster(fmt)) {
+        m_estimateLabel->setText("Estimate: vector format (size depends on content)");
+        return;
+    }
+
+    int dpi = m_dpiSpin->value();
+    int quality = m_qualitySpin->value();
+
+    // Estimate total pixels across all PDFs
+    // We use getPageCount + pagePointSize to get dimensions without rendering
+    // For speed, we only check the first PDF and extrapolate
+    // (scanning all pages of all PDFs would be too slow for large batches)
+    long long totalPixels = 0;
+    int totalFiles = m_pdfFiles.size();
+    int sampledPages = 0;
+
+    // Sample up to 3 files to get average page size
+    int sampleCount = qMin(totalFiles, 3);
+    double avgPagePixels = 0;
+    int avgPageCount = 0;
+
+    for (int i = 0; i < sampleCount; ++i) {
+        const QString &pdfPath = m_pdfFiles[i];
+#ifdef HAVE_QT_PDF
+        QPdfDocument doc;
+        if (doc.load(pdfPath) != QPdfDocument::Error::None)
+            continue;
+        int pages = doc.pageCount();
+        if (pages == 0) continue;
+        avgPageCount += pages;
+        // Sample first and last page dimensions
+        for (int p : {0, pages - 1}) {
+            QSizeF pts = doc.pagePointSize(p);
+            double scale = static_cast<double>(dpi) / 72.0;
+            avgPagePixels += pts.width() * scale * pts.height() * scale;
+            sampledPages++;
+        }
+#else
+        // Fallback: just use file size as a rough proxy
+        avgPagePixels += 1000000;  // placeholder
+        sampledPages++;
+#endif
+    }
+
+    if (sampledPages == 0) {
+        m_estimateLabel->setText("Estimate: (unable to read PDFs)");
+        return;
+    }
+
+    avgPagePixels /= sampledPages;
+
+#ifdef HAVE_QT_PDF
+    // Extrapolate: total pages ≈ (avgPageCount / sampleCount) * totalFiles
+    int estTotalPages = (avgPageCount * totalFiles) / qMax(1, sampleCount);
+    totalPixels = static_cast<long long>(avgPagePixels * estTotalPages);
+#else
+    // Fallback: rough estimate based on file count
+    totalPixels = static_cast<long long>(avgPagePixels * totalFiles * 2);  // assume ~2 pages avg
+    int estTotalPages = totalFiles * 2;
+#endif
+
+    // Estimate bytes per pixel based on format and quality
+    // These are empirical values (bytes per megapixel):
+    // JPEG @ q90 ≈ 0.25 MB/MP, @ q60 ≈ 0.12 MB/MP
+    // PNG ≈ 0.5 MB/MP (lossless, varies)
+    // WebP @ q90 ≈ 0.18 MB/MP
+    // TIFF/BMP ≈ 3.0 MB/MP (uncompressed)
+    double bytesPerPixel;
+    QString fmtName;
+    switch (fmt) {
+    case OutputFormat::JPEG:
+        bytesPerPixel = (quality / 100.0) * 0.28 + 0.05;
+        fmtName = "JPEG";
+        break;
+    case OutputFormat::PNG:
+        bytesPerPixel = 0.45;
+        fmtName = "PNG";
+        break;
+    case OutputFormat::WebP:
+        bytesPerPixel = (quality / 100.0) * 0.20 + 0.04;
+        fmtName = "WebP";
+        break;
+    case OutputFormat::TIFF:
+        bytesPerPixel = 3.0;
+        fmtName = "TIFF";
+        break;
+    case OutputFormat::BMP:
+        bytesPerPixel = 3.0;
+        fmtName = "BMP";
+        break;
+    default:
+        bytesPerPixel = 0.25;
+        fmtName = "?";
+    }
+
+    double estSizeMB = (totalPixels / 1000000.0) * bytesPerPixel;
+
+    // Format the size nicely
+    QString sizeStr;
+    if (estSizeMB < 1) {
+        sizeStr = QString("%1 KB").arg(static_cast<int>(estSizeMB * 1024));
+    } else if (estSizeMB < 1024) {
+        sizeStr = QString("%1 MB").arg(estSizeMB, 0, 'f', 1);
+    } else {
+        sizeStr = QString("%1 GB").arg(estSizeMB / 1024, 0, 'f', 2);
+    }
+
+    // Show per-page size too
+    double perPageMB = (avgPagePixels / 1000000.0) * bytesPerPixel;
+    QString perPageStr;
+    if (perPageMB < 1) {
+        perPageStr = QString("~%1 KB/page").arg(static_cast<int>(perPageMB * 1024));
+    } else {
+        perPageStr = QString("~%1 MB/page").arg(perPageMB, 0, 'f', 1);
+    }
+
+#ifdef HAVE_QT_PDF
+    m_estimateLabel->setText(QString("Estimate: ~%1 total (%2, %3 pages, %4 DPI, q%5)")
+        .arg(sizeStr).arg(fmtName).arg(estTotalPages).arg(dpi).arg(quality));
+#else
+    m_estimateLabel->setText(QString("Estimate: ~%1 total (%2, %3, %4 DPI, q%5)")
+        .arg(sizeStr).arg(fmtName).arg(perPageStr).arg(dpi).arg(quality));
+#endif
 }
 
 void MainWindow::onConvert()
