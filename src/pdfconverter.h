@@ -7,6 +7,10 @@
 #include <QImage>
 #include <functional>
 
+#ifdef HAVE_QT_PDF
+#include <QPdfDocument>
+#endif
+
 enum class OutputFormat {
     // Raster
     JPEG,
@@ -105,7 +109,16 @@ public slots:
 private:
     bool m_cancelled = false;
 
-    QImage renderPage(class QPdfDocument *doc, int pageIndex, int dpi);
+    QImage renderPage(
+#ifdef HAVE_QT_PDF
+        class QPdfDocument *doc,
+#else
+        void *doc,  // unused when no Qt PDF
+#endif
+        int pageIndex, int dpi);
+    
+    // Fallback: render a PDF page using pdftocairo CLI (when Qt6::Pdf not available)
+    QImage renderPageViaPdftocairo(const QString &pdfPath, int pageIndex, int dpi);
     bool saveImage(const QImage &image, const QString &path,
                    OutputFormat format, int quality);
 };

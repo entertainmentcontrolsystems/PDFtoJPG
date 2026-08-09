@@ -8,7 +8,18 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # ── Qt6 ──────────────────────────────────────────────────────────────
-find_package(Qt6 REQUIRED COMPONENTS Widgets Pdf Concurrent)
+# Qt6::Pdf is optional — if not installed, we fall back to pdftocairo
+# for page count + raster rendering.
+find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent)
+find_package(Qt6 COMPONENTS Pdf)
+
+if(Qt6Pdf_FOUND)
+    message(STATUS "Qt6::Pdf found — native PDF rendering enabled")
+    set(HAVE_QT_PDF ON)
+else()
+    message(STATUS "Qt6::Pdf NOT found — will use pdftocairo for raster rendering")
+    set(HAVE_QT_PDF OFF)
+endif()
 
 # ── Application ───────────────────────────────────────────────────────
 set(APP_SOURCES
@@ -35,7 +46,7 @@ else()
 endif()
 
 set_target_properties(ecs_pdf_converter PROPERTIES
-    OUTPUT_NAME "ECS PDF Converter"
+    OUTPUT_NAME "ECSPdfConverter"
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_BUNDLE_NAME "ECS PDF Converter"
     MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
@@ -46,9 +57,13 @@ set_target_properties(ecs_pdf_converter PROPERTIES
 
 target_link_libraries(ecs_pdf_converter PRIVATE
     Qt6::Widgets
-    Qt6::Pdf
     Qt6::Concurrent
 )
+
+if(HAVE_QT_PDF)
+    target_link_libraries(ecs_pdf_converter PRIVATE Qt6::Pdf)
+    target_compile_definitions(ecs_pdf_converter PRIVATE HAVE_QT_PDF)
+endif()
 
 target_include_directories(ecs_pdf_converter PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

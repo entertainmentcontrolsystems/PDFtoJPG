@@ -1,10 +1,14 @@
 #include "pdfconverter.h"
 
+#ifdef HAVE_QT_PDF
 #include <QPdfDocument>
+#endif
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QPainter>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QDebug>
 
 PdfConverter::PdfConverter(QObject *parent)
@@ -14,10 +18,26 @@ PdfConverter::PdfConverter(QObject *parent)
 
 int PdfConverter::getPageCount(const QString &pdfPath)
 {
+#ifdef HAVE_QT_PDF
     QPdfDocument doc;
     if (doc.load(pdfPath) != QPdfDocument::Error::None)
         return 0;
     return doc.pageCount();
+#else
+    // Fallback: use pdfinfo (from Poppler) to get page count
+    QProcess proc;
+    QStringList args;
+    args << "-showpages" << pdfPath;
+    proc.start("pdfinfo", args);
+    if (!proc.waitForFinished(10000))
+        return 0;
+    QString output = proc.readAllStandardOutput();
+    QRegularExpression re("Pages:\\s+(\\d+)");
+    auto m = re.match(output);
+    if (m.hasMatch())
+        return m.captured(1).toInt();
+    return 0;
+#endif
 }
 
 QList<int> PdfConverter::parsePageRange(const QString &range, int totalPages)
@@ -126,8 +146,15 @@ bool PdfConverter::isVector(OutputFormat fmt)
     return !isRaster(fmt);
 }
 
-QImage PdfConverter::renderPage(QPdfDocument *doc, int pageIndex, int dpi)
+QImage PdfConverter::renderPage(
+#ifdef HAVE_QT_PDF
+    QPdfDocument *doc,
+#else
+    void *doc,
+#endif
+    int pageIndex, int dpi)
 {
+#ifdef HAVE_QT_PDF
     // Get page size in points (1/72 inch)
     QSizeF pageSize = doc->pagePointSize(pageIndex);
     if (pageSize.isEmpty())
@@ -139,8 +166,40 @@ QImage PdfConverter::renderPage(QPdfDocument *doc, int pageIndex, int dpi)
     int heightPx = static_cast<int>(pageSize.height() * scale);
 
     // Render
-    QImage image = doc->render(pageIndex, QSize(widthPx, heightPx));
-    return image;
+    return doc->render(pageIndex, QSize(widthPx, heightPx));
+#else
+    Q_UNUSED(doc)
+    Q_UNUSED(pageIndex)
+    Q_UNUSED(dpi)
+    return QImage();
+#endif
+}
+
+// Render a PDF page using pdftocairo (fallback when Qt6::Pdf not available)
+// Renders to PNG via pdftocairo, then loads the PNG as a QImage
+QImage PdfConverter::renderPageViaPdftocairo(const QString &pdfPath, int pageIndex, int dpi)
+{
+    QProcess proc;
+    QStringList args;
+    args << "-png"                    // PNG output
+         << "-r" << QString::number(dpi)   // DPI
+         << "-f" << QString::number(pageIndex + 1)  // 1-indexed
+         << "-l" << QString::number(pageIndex + 1)
+         << "-singlefile"
+         << pdfPath
+         << "/tmp/ecs_pdf_render";   // output base (pdftocairo appends .png)
+
+    proc.start("pdftocairo", args);
+    if (!proc.waitForFinished(30000))
+        return QImage();
+
+    QString pngPath = "/tmp/ecs_pdf_render.png";
+    QImage image;
+    if (image.load(pngPath)) {
+        QFile::remove(pngPath);
+        return image;
+    }
+    return QImage();
 }
 
 bool PdfConverter::saveImage(const QImage &image, const QString &path,
@@ -176,6 +235,7 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
 {
     m_cancelled = false;
 
+#ifdef HAVE_QT_PDF
     QPdfDocument doc;
     if (doc.load(pdfPath) != QPdfDocument::Error::None) {
         emit fileDone(fileIndex, false, 0, "Failed to open PDF");
@@ -183,6 +243,9 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
     }
 
     int totalPages = doc.pageCount();
+#else
+    int totalPages = getPageCount(pdfPath);
+#endif
     if (totalPages == 0) {
         emit fileDone(fileIndex, false, 0, "PDF has no pages");
         return;
@@ -214,7 +277,12 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
         }
 
         // Render
-        QImage image = renderPage(&doc, pageIdx, opts.dpi);
+        QImage image;
+#ifdef HAVE_QT_PDF
+        image = renderPage(&doc, pageIdx, opts.dpi);
+#else
+        image = renderPageViaPdftocairo(pdfPath, pageIdx, opts.dpi);
+#endif
         if (image.isNull()) {
             qWarning() << "Failed to render page" << pageIdx << "of" << pdfPath;
             continue;
