@@ -1,7 +1,24 @@
-venv/
-__pycache__/
-*.pyc
-.DS_Store
-*.exe
-dist/
+# Build artifacts
 build/
+dist/
+*.o
+*.obj
+*.exe
+*.app
+*.dmg
+
+# IDE files
+.vscode/
+.idea/
+*.user
+*.suo
+.vs/
+
+# macOS
+.DS_Store
+
+# Third-party binaries (downloaded separately)
+third_party/pdfium/
+third_party/potrace/
+third_party/pdftocairo/
+third_party/autotrace/

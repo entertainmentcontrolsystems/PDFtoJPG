@@ -1,149 +1,129 @@
 @echo off
-:: build_windows.bat
-:: -----------------
-:: Builds pdf_to_jpg.exe on Windows using PyInstaller inside an
-:: isolated virtual environment so system packages never pollute the build.
+:: build_windows.bat — Build ECS PDF Converter on Windows
+:: Produces: build\Release\ECS PDF Converter.exe (with Qt DLLs via windeployqt)
 ::
-:: Prerequisites (one-time):
-::   - Python 3.9+ installed and on PATH
-::   - Poppler for Windows installed and on PATH
-::       Download: https://github.com/oschwartz10612/poppler-windows/releases
-::       Extract and add the \Library\bin folder to your system PATH
+:: Prerequisites:
+::   - Qt 6.6+ (install via Qt Online Installer, select MSVC build)
+::   - Visual Studio 2022+ with C++ build tools
+::   - CMake 3.21+
 ::
-:: Usage:
-::   Double-click this file, or run from the project folder:
-::     build_windows.bat
-::
-:: Output:
-::   dist\pdf_to_jpg\pdf_to_jpg.exe   (and supporting files)
-::
-:: Next step (optional):
-::   Compile build_installer.iss with Inno Setup to produce a
-::   single Setup.exe installer for distribution.
+:: For vector output (optional):
+::   - Poppler for Windows (pdftocairo.exe)
+::   - Potrace for Windows (potrace.exe)
+::   Bundle these in a "tools\" subfolder next to the .exe
 
 setlocal enabledelayedexpansion
 
 echo.
 echo ============================================================
-echo  PDF to JPG Converter -- Windows Build Script
+echo  ECS PDF Converter -- Windows Build
 echo ============================================================
 echo.
 
-:: ------------------------------------------------------------------
-:: 1. Verify Python is available
-:: ------------------------------------------------------------------
-where python >nul 2>&1
+:: ── 1. Check prerequisites ──────────────────────────────────────
+echo [1/5] Checking prerequisites...
+
+where cmake >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: Python not found on PATH.
-    echo Install Python 3.9+ from https://python.org and try again.
-    pause
+    echo ERROR: CMake not found. Install from https://cmake.org
     exit /b 1
 )
 
-for /f "tokens=*" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo Found: %PYVER%
-echo.
-
-:: ------------------------------------------------------------------
-:: 2. Create a clean virtual environment for the build
-:: ------------------------------------------------------------------
-echo [1/6] Creating isolated build environment...
-if exist build_venv (
-    echo       Removing old build_venv...
-    rmdir /s /q build_venv
-)
-python -m venv build_venv
+where cl >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: Failed to create virtual environment.
-    pause
+    echo ERROR: MSVC compiler not found.
+    echo Run from "x64 Native Tools Command Prompt for VS 2022"
     exit /b 1
 )
-echo       Done.
+
+for /f "tokens=*" %%v in ('cmake --version 2^>^&1') do set CMVER=%%v
+echo Found: %CMVER%
 echo.
 
-:: ------------------------------------------------------------------
-:: 3. Activate venv and upgrade pip
-:: ------------------------------------------------------------------
-echo [2/6] Activating venv and upgrading pip...
-call build_venv\Scripts\activate.bat
-python -m pip install --upgrade pip --quiet
-echo       Done.
-echo.
+:: ── 2. Find Qt6 ────────────────────────────────────────────────
+echo [2/5] Locating Qt6...
 
-:: ------------------------------------------------------------------
-:: 4. Install runtime dependencies
-:: ------------------------------------------------------------------
-echo [3/6] Installing runtime dependencies...
-pip install pdf2image Pillow --quiet
-if %errorlevel% neq 0 (
-    echo ERROR: Failed to install dependencies.
-    pause
+set "QT_DIR="
+for /f "delims=" %%i in ('dir /b /ad "C:\Qt\6.*" 2^>nul') do (
+    if exist "C:\Qt\%%i\msvc*\lib\Qt6Core.lib" (
+        set "QT_DIR=C:\Qt\%%i\msvc*"
+        set "QT_VERSION=%%i"
+    )
+)
+
+if not defined QT_VERSION (
+    for /f "delims=" %%i in ('dir /b /ad "C:\Qt\6.*" 2^>nul') do (
+        for /f "delims=" %%j in ('dir /b /ad "C:\Qt\%%i" 2^>nul') do (
+            if exist "C:\Qt\%%i\%%j\lib\Qt6Core.lib" (
+                set "QT_DIR=C:\Qt\%%i\%%j"
+                set "QT_VERSION=%%i"
+            )
+        )
+    )
+)
+
+if not defined QT_VERSION (
+    echo ERROR: Qt6 not found in C:\Qt\
+    echo Install Qt6 via the Qt Online Installer.
     exit /b 1
 )
-echo       Done.
-echo.
 
-:: ------------------------------------------------------------------
-:: 5. Install PyInstaller
-:: ------------------------------------------------------------------
-echo [4/6] Installing PyInstaller...
-pip install pyinstaller --quiet
-if %errorlevel% neq 0 (
-    echo ERROR: Failed to install PyInstaller.
-    pause
-    exit /b 1
+:: Resolve wildcard in QT_DIR
+for /f "delims=" %%d in ('dir /b /ad "%QT_DIR%" 2^>nul') do (
+    if exist "%QT_DIR%\%%d\lib\Qt6Core.lib" set "QT_DIR=%QT_DIR%\%%d"
 )
-echo       Done.
+
+echo   Qt: %QT_VERSION% at %QT_DIR%
 echo.
 
-:: ------------------------------------------------------------------
-:: 6. Clean previous build artifacts
-:: ------------------------------------------------------------------
-echo [5/6] Cleaning previous build output...
+:: ── 3. Clean build ──────────────────────────────────────────────
+echo [3/5] Cleaning previous build...
 if exist build rmdir /s /q build
-if exist dist  rmdir /s /q dist
-echo       Done.
+mkdir build
+echo   Done.
 echo.
 
-:: ------------------------------------------------------------------
-:: 7. Run PyInstaller
-:: ------------------------------------------------------------------
-echo [6/6] Running PyInstaller...
-echo.
-pyinstaller pdf_to_jpg.spec
+:: ── 4. CMake configure + build ──────────────────────────────────
+echo [4/5] Building...
+cd build
+
+set "CMAKE_PREFIX_PATH=%QT_DIR%"
+
+cmake -G "Ninja" -DCMAKE_BUILD_TYPE=Release .. 2>&1
 if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: PyInstaller failed. See output above for details.
-    call build_venv\Scripts\deactivate.bat 2>nul
-    pause
+    echo ERROR: CMake configuration failed.
     exit /b 1
 )
+
+cmake --build . --config Release 2>&1
+if %errorlevel% neq 0 (
+    echo ERROR: Build failed.
+    exit /b 1
+)
+
 echo.
 
-:: ------------------------------------------------------------------
-:: 8. Deactivate venv
-:: ------------------------------------------------------------------
-call build_venv\Scripts\deactivate.bat 2>nul
+:: ── 5. Deploy ──────────────────────────────────────────────────
+echo [5/5] Deploying Qt dependencies...
 
-:: ------------------------------------------------------------------
-:: 9. Report success
-:: ------------------------------------------------------------------
+set "WINDEPLOYQT=%QT_DIR%\bin\windeployqt.exe"
+if not exist "%WINDEPLOYQT%" (
+    echo WARNING: windeployqt not found at %WINDEPLOYQT%
+    echo The .exe is at build\Release\ECS PDF Converter.exe
+    echo You'll need to manually run windeployqt or distribute Qt DLLs.
+) else (
+    "%WINDEPLOYQT%" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "Release\ECS PDF Converter.exe"
+    echo   Deployed.
+)
+
 echo.
 echo ============================================================
 echo  BUILD SUCCEEDED
 echo.
-echo  Executable:  dist\pdf_to_jpg\pdf_to_jpg.exe
-echo  Full bundle: dist\pdf_to_jpg\
+echo  Executable: build\Release\ECS PDF Converter.exe
 echo.
-echo  IMPORTANT: Poppler must be installed on the user's machine
-echo  and on their system PATH for the converter to work.
-echo  Direct users to:
-echo    https://github.com/oschwartz10612/poppler-windows/releases
-echo.
-echo  Optional next step:
-echo    Compile build_installer.iss with Inno Setup to produce a
-echo    single-click Setup.exe that also reminds users about Poppler.
-echo    (Free: https://jrsoftware.org/isinfo.php)
+echo  For vector output, bundle these in build\Release\tools\:
+echo    - pdftocairo.exe (from Poppler for Windows)
+echo    - potrace.exe (from https://potrace.sourceforge.net/)
 echo ============================================================
 echo.
-pause
