@@ -51,7 +51,9 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Set tools directory (bundled CLI tools)
     QString appDir = QCoreApplication::applicationDirPath();
-    m_vectorConverter->setToolsDir(QDir(appDir).absoluteFilePath("tools"));
+    QString toolsDir = QDir(appDir).absoluteFilePath("tools");
+    m_rasterConverter->setToolsDir(toolsDir);
+    m_vectorConverter->setToolsDir(toolsDir);
 
     buildUi();
 
@@ -67,8 +69,8 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onFileDone);
 
     setWindowTitle("ECS PDF Converter");
-    setMinimumSize(720, 560);
-    resize(800, 640);
+    setMinimumSize(820, 620);
+    resize(920, 700);
 }
 
 MainWindow::~MainWindow() = default;
@@ -136,7 +138,11 @@ void MainWindow::buildUi()
     // ── Output / Options ──
     auto *outputGroup = new QGroupBox("Output");
     auto *outputLayout = new QGridLayout(outputGroup);
-    outputLayout->setSpacing(8);
+    outputLayout->setSpacing(10);
+    outputLayout->setContentsMargins(12, 10, 12, 10);
+    // Give column 1 plenty of room so dropdowns/spinboxes don't clip
+    outputLayout->setColumnMinimumWidth(1, 280);
+    outputLayout->setColumnStretch(1, 1);
 
     // Output folder
     outputLayout->addWidget(new QLabel("Output folder:"), 0, 0);
@@ -150,6 +156,8 @@ void MainWindow::buildUi()
     // Format
     outputLayout->addWidget(new QLabel("Format:"), 1, 0);
     m_formatCombo = new QComboBox;
+    m_formatCombo->setMinimumWidth(300);
+    m_formatCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     m_formatCombo->addItem("JPEG", static_cast<int>(OutputFormat::JPEG));
     m_formatCombo->addItem("PNG", static_cast<int>(OutputFormat::PNG));
     m_formatCombo->addItem("WebP", static_cast<int>(OutputFormat::WebP));
@@ -169,6 +177,7 @@ void MainWindow::buildUi()
     m_dpiSpin->setRange(72, 600);
     m_dpiSpin->setValue(150);
     m_dpiSpin->setSingleStep(50);
+    m_dpiSpin->setMinimumWidth(100);
     outputLayout->addWidget(m_dpiSpin, 2, 1);
 
     // Quality
@@ -177,6 +186,7 @@ void MainWindow::buildUi()
     m_qualitySpin->setRange(1, 100);
     m_qualitySpin->setValue(90);
     m_qualitySpin->setSingleStep(5);
+    m_qualitySpin->setMinimumWidth(100);
     outputLayout->addWidget(m_qualitySpin, 3, 1);
 
     // Page range

@@ -9,11 +9,30 @@
 #include <QPainter>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QCoreApplication>
 #include <QDebug>
 
 PdfConverter::PdfConverter(QObject *parent)
     : QObject(parent)
 {
+}
+
+QString PdfConverter::findTool(const QString &name, const QString &toolsDir)
+{
+#ifdef Q_OS_WIN
+    QString exeName = name + ".exe";
+#else
+    QString exeName = name;
+#endif
+
+    // Check toolsDir first
+    if (!toolsDir.isEmpty()) {
+        QString candidate = QDir(toolsDir).absoluteFilePath(exeName);
+        if (QFileInfo::exists(candidate))
+            return candidate;
+    }
+    // Then check PATH
+    return QStandardPaths::findExecutable(exeName);
 }
 
 int PdfConverter::getPageCount(const QString &pdfPath)
@@ -25,10 +44,16 @@ int PdfConverter::getPageCount(const QString &pdfPath)
     return doc.pageCount();
 #else
     // Fallback: use pdfinfo (from Poppler) to get page count
+    // Note: getPageCount is static, so we can't use m_toolsDir here.
+    // We check the app's tools/ directory as a convention.
+    QString toolsDir = QCoreApplication::applicationDirPath() + "/tools";
+    QString tool = findTool("pdfinfo", toolsDir);
+    if (tool.isEmpty()) {
+        qWarning() << "pdfinfo not found";
+        return 0;
+    }
     QProcess proc;
-    QStringList args;
-    args << "-showpages" << pdfPath;
-    proc.start("pdfinfo", args);
+    proc.start(tool, QStringList() << pdfPath);
     if (!proc.waitForFinished(10000))
         return 0;
     QString output = proc.readAllStandardOutput();
@@ -179,6 +204,16 @@ QImage PdfConverter::renderPage(
 // Renders to PNG via pdftocairo, then loads the PNG as a QImage
 QImage PdfConverter::renderPageViaPdftocairo(const QString &pdfPath, int pageIndex, int dpi)
 {
+    QString tool = findTool("pdftocairo", m_toolsDir);
+    if (tool.isEmpty()) {
+        qWarning() << "pdftocairo not found";
+        return QImage();
+    }
+
+    // Render to a temp file
+    QString tempBase = QDir::temp().absoluteFilePath(
+        QString("ecs_pdf_%1_%2").arg(QFileInfo(pdfPath).baseName()).arg(pageIndex));
+
     QProcess proc;
     QStringList args;
     args << "-png"                    // PNG output
@@ -187,18 +222,28 @@ QImage PdfConverter::renderPageViaPdftocairo(const QString &pdfPath, int pageInd
          << "-l" << QString::number(pageIndex + 1)
          << "-singlefile"
          << pdfPath
-         << "/tmp/ecs_pdf_render";   // output base (pdftocairo appends .png)
+         << tempBase;                // output base (pdftocairo appends .png)
 
-    proc.start("pdftocairo", args);
-    if (!proc.waitForFinished(30000))
+    proc.start(tool, args);
+    if (!proc.waitForFinished(60000)) {
+        qWarning() << "pdftocairo timed out";
         return QImage();
+    }
 
-    QString pngPath = "/tmp/ecs_pdf_render.png";
+    if (proc.exitCode() != 0) {
+        qWarning() << "pdftocairo failed, exit code" << proc.exitCode()
+                  << ":" << proc.readAllStandardError();
+        return QImage();
+    }
+
+    QString pngPath = tempBase + ".png";
     QImage image;
     if (image.load(pngPath)) {
         QFile::remove(pngPath);
         return image;
     }
+    qWarning() << "Failed to load rendered PNG:" << pngPath;
+    QFile::remove(pngPath);
     return QImage();
 }
 

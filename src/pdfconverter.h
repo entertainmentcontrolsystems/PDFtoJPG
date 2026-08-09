@@ -72,6 +72,9 @@ class PdfConverter : public QObject
 public:
     explicit PdfConverter(QObject *parent = nullptr);
 
+    // Set the directory where bundled CLI tools live (pdftocairo, pdfinfo)
+    void setToolsDir(const QString &dir) { m_toolsDir = dir; }
+
     // Convert a single PDF file to raster images
     // Emits pageProgress and fileDone signals during conversion
     void convertToRaster(const QString &pdfPath,
@@ -108,6 +111,7 @@ public slots:
 
 private:
     bool m_cancelled = false;
+    QString m_toolsDir;
 
     QImage renderPage(
 #ifdef HAVE_QT_PDF
@@ -121,6 +125,9 @@ private:
     QImage renderPageViaPdftocairo(const QString &pdfPath, int pageIndex, int dpi);
     bool saveImage(const QImage &image, const QString &path,
                    OutputFormat format, int quality);
+
+    // Find a CLI tool: check toolsDir first, then PATH
+    static QString findTool(const QString &name, const QString &toolsDir = QString());
 };
 
 #endif // PDFCONVERTER_H

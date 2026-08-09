@@ -88,6 +88,16 @@ if(WIN32)
             COMMENT "Running windeployqt..."
         )
     endif()
+
+    # Copy bundled Poppler tools (pdftocairo, pdfinfo) into build directory
+    set(POPLER_DIR "" CACHE PATH "Path to Poppler Library/bin directory")
+    if(EXISTS "${POPLER_DIR}/pdftocairo.exe")
+        add_custom_command(TARGET ecs_pdf_converter POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ecs_pdf_converter>/tools"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${POPLER_DIR}" "$<TARGET_FILE_DIR:ecs_pdf_converter>/tools/"
+            COMMENT "Bundling Poppler tools..."
+        )
+    endif()
 elseif(APPLE)
     find_program(MACDEPLOYQT macdeployqt HINTS ${Qt6_DIR}/../../../bin)
     if(MACDEPLOYQT)
