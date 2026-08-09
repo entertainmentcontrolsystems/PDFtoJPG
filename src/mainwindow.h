@@ -3,8 +3,7 @@
 
 #include <QMainWindow>
 #include <QStringList>
-#include <QFuture>
-#include <QFutureWatcher>
+#include <QFutureWatcher>  // full header, not just forward decl
 
 #include "pdfconverter.h"
 #include "vectorconverter.h"
@@ -31,8 +30,6 @@ protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
 
-friend class QDropArea;
-
 private slots:
     void onBrowseSource();
     void onBrowseOutput();
@@ -43,7 +40,7 @@ private slots:
     void onFormatChanged(int index);
 
     void onPageProgress(int fileIndex, int pageIndex, int totalPages, int percent);
-    void onFileDone(int fileIndex, bool success, int pagesWritten, const QString &message);
+    void onFileDone(int fileIndex, bool success, int pagesWritten, int pagesFailed, const QString &message);
     void onAllDone(const ConversionResult &result);
 
 private:
@@ -63,6 +60,9 @@ private:
     int m_totalFilesConverted = 0;
     int m_totalErrors = 0;
     int m_totalPagesRendered = 0;
+    int m_totalPagesFailed = 0;
+
+    QFutureWatcher<void> *m_futureWatcher = nullptr;
 
     // ── UI elements ──
     QDropArea *m_dropArea;
@@ -75,6 +75,8 @@ private:
     QComboBox *m_formatCombo;
     QSpinBox *m_dpiSpin;
     QSpinBox *m_qualitySpin;
+    QLabel *m_dpiLabel;
+    QLabel *m_qualityLabel;
     QCheckBox *m_splitCheck;
     QCheckBox *m_sameFolderCheck;
     QCheckBox *m_overwriteCheck;
@@ -85,6 +87,8 @@ private:
     QPushButton *m_convertBtn;
     QPushButton *m_cancelBtn;
     QPushButton *m_clearBtn;
+
+    friend class QDropArea;
 };
 
 #endif // MAINWINDOW_H

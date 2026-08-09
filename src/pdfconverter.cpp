@@ -44,8 +44,6 @@ int PdfConverter::getPageCount(const QString &pdfPath)
     return doc.pageCount();
 #else
     // Fallback: use pdfinfo (from Poppler) to get page count
-    // Note: getPageCount is static, so we can't use m_toolsDir here.
-    // We check the app's tools/ directory as a convention.
     QString toolsDir = QCoreApplication::applicationDirPath() + "/tools";
     QString tool = findTool("pdfinfo", toolsDir);
     if (tool.isEmpty()) {
@@ -72,6 +70,9 @@ QList<int> PdfConverter::parsePageRange(const QString &range, int totalPages)
     if (range.trimmed().isEmpty())
         return pages;  // empty = all pages (caller handles)
 
+    if (totalPages <= 0)
+        return pages;
+
     // Parse "1-5, 8, 11-13" into individual 0-indexed page numbers
     const auto parts = range.split(',', Qt::SkipEmptyParts);
     for (const QString &part : parts) {
@@ -82,6 +83,8 @@ QList<int> PdfConverter::parsePageRange(const QString &range, int totalPages)
             int start = trimmed.left(dash).trimmed().toInt(&ok1);
             int end = trimmed.mid(dash + 1).trimmed().toInt(&ok2);
             if (!ok1 || !ok2) continue;
+            // Validate: reject reversed ranges
+            if (start > end) continue;
             for (int p = start; p <= end && p <= totalPages; ++p) {
                 if (p >= 1)
                     pages.append(p - 1);  // 1-indexed → 0-indexed
@@ -112,12 +115,12 @@ QString PdfConverter::outputFilePath(const QString &pdfPath,
         outDir = fi.absolutePath();
     } else {
         outDir = opts.outputDir;
-        // Mirror subfolder structure if source is recursive
-        // (handled by caller for batch mode)
     }
 
     QString filename;
-    if (totalPages == 1 || !opts.splitPages) {
+    // Always number pages when there are multiple pages, even if splitPages is false
+    // (prevents silent overwrite — H2 fix)
+    if (totalPages == 1) {
         filename = baseName + "." + ext;
     } else {
         int digits = qMax(2, QString::number(totalPages).length());
@@ -136,7 +139,6 @@ QString PdfConverter::formatExtension(OutputFormat fmt)
     case OutputFormat::TIFF:      return "tiff";
     case OutputFormat::BMP:       return "bmp";
     case OutputFormat::SVG_Vector: return "svg";
-    case OutputFormat::SVG_Traced:  return "svg";
     case OutputFormat::DXF:       return "dxf";
     }
     return "jpg";
@@ -151,7 +153,6 @@ QString PdfConverter::formatName(OutputFormat fmt)
     case OutputFormat::TIFF:      return "TIFF";
     case OutputFormat::BMP:       return "BMP";
     case OutputFormat::SVG_Vector: return "SVG (Vector)";
-    case OutputFormat::SVG_Traced:  return "SVG (Traced)";
     case OutputFormat::DXF:       return "DXF (CAD)";
     }
     return "JPEG";
@@ -210,9 +211,11 @@ QImage PdfConverter::renderPageViaPdftocairo(const QString &pdfPath, int pageInd
         return QImage();
     }
 
-    // Render to a temp file
+    // Render to a temp file with unique name (fix L3: collision risk)
     QString tempBase = QDir::temp().absoluteFilePath(
-        QString("ecs_pdf_%1_%2").arg(QFileInfo(pdfPath).baseName()).arg(pageIndex));
+        QString("ecs_pdf_%1_%2_%3").arg(QFileInfo(pdfPath).completeBaseName())
+                                    .arg(pageIndex)
+                                    .arg(QCoreApplication::applicationPid()));
 
     QProcess proc;
     QStringList args;
@@ -227,12 +230,14 @@ QImage PdfConverter::renderPageViaPdftocairo(const QString &pdfPath, int pageInd
     proc.start(tool, args);
     if (!proc.waitForFinished(60000)) {
         qWarning() << "pdftocairo timed out";
+        QFile::remove(tempBase + ".png");  // H6 fix: clean up on timeout
         return QImage();
     }
 
     if (proc.exitCode() != 0) {
         qWarning() << "pdftocairo failed, exit code" << proc.exitCode()
                   << ":" << proc.readAllStandardError();
+        QFile::remove(tempBase + ".png");
         return QImage();
     }
 
@@ -283,7 +288,7 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
 #ifdef HAVE_QT_PDF
     QPdfDocument doc;
     if (doc.load(pdfPath) != QPdfDocument::Error::None) {
-        emit fileDone(fileIndex, false, 0, "Failed to open PDF");
+        emit fileDone(fileIndex, false, 0, 0, "Failed to open PDF");
         return;
     }
 
@@ -292,7 +297,7 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
     int totalPages = getPageCount(pdfPath);
 #endif
     if (totalPages == 0) {
-        emit fileDone(fileIndex, false, 0, "PDF has no pages");
+        emit fileDone(fileIndex, false, 0, 0, "PDF has no pages");
         return;
     }
 
@@ -304,11 +309,13 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
     }
 
     int pagesWritten = 0;
+    int pagesFailed = 0;
+    int pagesSkipped = 0;
     int pagesTotal = pages.size();
 
     for (int i = 0; i < pagesTotal; ++i) {
         if (m_cancelled) {
-            emit fileDone(fileIndex, false, pagesWritten, "Cancelled");
+            emit fileDone(fileIndex, false, pagesWritten, pagesFailed, "Cancelled");
             return;
         }
 
@@ -317,7 +324,7 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
         // Check overwrite
         QString outPath = outputFilePath(pdfPath, opts, pageIdx, totalPages);
         if (!opts.overwrite && QFileInfo::exists(outPath)) {
-            pagesWritten++;
+            pagesSkipped++;
             continue;
         }
 
@@ -330,12 +337,14 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
 #endif
         if (image.isNull()) {
             qWarning() << "Failed to render page" << pageIdx << "of" << pdfPath;
+            pagesFailed++;
             continue;
         }
 
         // Save
         if (!saveImage(image, outPath, opts.format, opts.quality)) {
             qWarning() << "Failed to save" << outPath;
+            pagesFailed++;
             continue;
         }
 
@@ -346,10 +355,19 @@ void PdfConverter::convertToRaster(const QString &pdfPath,
         emit pageProgress(fileIndex, i, pagesTotal, percent);
     }
 
-    QString msg = QString("Converted %1 → %2 pages")
-                      .arg(QFileInfo(pdfPath).fileName())
-                      .arg(pagesWritten);
-    emit fileDone(fileIndex, true, pagesWritten, msg);
+    // H1 fix: report success=false when any pages failed
+    bool success = (pagesFailed == 0);
+    QString msg;
+    if (pagesFailed == 0 && pagesSkipped == 0) {
+        msg = QString("Converted %1 → %2 pages").arg(QFileInfo(pdfPath).fileName()).arg(pagesWritten);
+    } else if (pagesFailed == 0) {
+        msg = QString("Converted %1 → %2 pages (%3 skipped)")
+                  .arg(QFileInfo(pdfPath).fileName()).arg(pagesWritten).arg(pagesSkipped);
+    } else {
+        msg = QString("Converted %1 → %2 pages, %3 failed, %4 skipped")
+                  .arg(QFileInfo(pdfPath).fileName()).arg(pagesWritten).arg(pagesFailed).arg(pagesSkipped);
+    }
+    emit fileDone(fileIndex, success, pagesWritten, pagesFailed, msg);
 }
 
 void PdfConverter::cancel()

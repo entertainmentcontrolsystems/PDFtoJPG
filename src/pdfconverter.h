@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QImage>
 #include <functional>
+#include <atomic>
 
 #ifdef HAVE_QT_PDF
 #include <QPdfDocument>
@@ -20,8 +21,8 @@ enum class OutputFormat {
     BMP,
     // Vector
     SVG_Vector,   // PDF → SVG (preserve vector geometry, via pdftocairo)
-    SVG_Traced,   // Image → SVG (raster trace, via potrace/autotrace)
     DXF           // PDF → SVG → DXF (for CAD import)
+    // Note: SVG_Traced removed — was dead path, never implemented
 };
 
 struct ConversionOptions {
@@ -44,15 +45,14 @@ struct ConversionOptions {
     bool sameFolder = false;       // Save beside source PDF
     bool overwrite = false;        // Overwrite existing files
     bool openWhenDone = true;      // Open output folder after conversion
-
-    // Vector options
-    bool traceColor = false;       // Color tracing (AutoTrace) vs B&W (Potrace)
 };
 
 struct ConversionResult {
     bool success = false;
     int filesProcessed = 0;
     int pagesRendered = 0;
+    int pagesFailed = 0;
+    int pagesSkipped = 0;
     int errors = 0;
     QString errorMessage;
 };
@@ -60,7 +60,7 @@ struct ConversionResult {
 Q_DECLARE_METATYPE(ConversionResult)
 
 /**
- * PdfConverter — raster conversion engine using QPdfDocument.
+ * PdfConverter — raster conversion engine using QPdfDocument or pdftocairo.
  *
  * Renders PDF pages to QImage at the requested DPI, then saves in the
  * selected raster format (JPEG, PNG, WebP, TIFF, BMP).
@@ -76,7 +76,6 @@ public:
     void setToolsDir(const QString &dir) { m_toolsDir = dir; }
 
     // Convert a single PDF file to raster images
-    // Emits pageProgress and fileDone signals during conversion
     void convertToRaster(const QString &pdfPath,
                          const ConversionOptions &opts,
                          int fileIndex,
@@ -103,26 +102,27 @@ public:
 
 signals:
     void pageProgress(int fileIndex, int pageIndex, int totalPages, int percent);
-    void fileDone(int fileIndex, bool success, int pagesWritten, const QString &message);
+    void fileDone(int fileIndex, bool success, int pagesWritten, int pagesFailed, const QString &message);
     void allDone(const ConversionResult &result);
 
 public slots:
     void cancel();
 
 private:
-    bool m_cancelled = false;
+    std::atomic<bool> m_cancelled{false};
     QString m_toolsDir;
 
     QImage renderPage(
 #ifdef HAVE_QT_PDF
-        class QPdfDocument *doc,
+        QPdfDocument *doc,
 #else
-        void *doc,  // unused when no Qt PDF
+        void *doc,
 #endif
         int pageIndex, int dpi);
-    
+
     // Fallback: render a PDF page using pdftocairo CLI (when Qt6::Pdf not available)
     QImage renderPageViaPdftocairo(const QString &pdfPath, int pageIndex, int dpi);
+
     bool saveImage(const QImage &image, const QString &path,
                    OutputFormat format, int quality);
 

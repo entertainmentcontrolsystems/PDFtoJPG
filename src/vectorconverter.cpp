@@ -6,9 +6,11 @@
 #include <QRegularExpression>
 #include <QXmlStreamReader>
 #include <QStandardPaths>
+#include <QCoreApplication>
 #include <QDebug>
 #include <QPainter>
 #include <QImage>
+#include <cmath>
 
 VectorConverter::VectorConverter(QObject *parent)
     : QObject(parent)
@@ -22,35 +24,22 @@ void VectorConverter::setToolsDir(const QString &dir)
 
 QString VectorConverter::findTool(const QString &name) const
 {
-    // Check toolsDir first
-    if (!m_toolsDir.isEmpty()) {
-        QString candidate = QDir(m_toolsDir).absoluteFilePath(name);
-        if (QFileInfo::exists(candidate))
-            return candidate;
 #ifdef Q_OS_WIN
-        candidate += ".exe";
+    QString exeName = name + ".exe";
+#else
+    QString exeName = name;
+#endif
+    if (!m_toolsDir.isEmpty()) {
+        QString candidate = QDir(m_toolsDir).absoluteFilePath(exeName);
         if (QFileInfo::exists(candidate))
             return candidate;
-#endif
     }
-    // Then check PATH
-    QString onPath = QStandardPaths::findExecutable(name);
-    return onPath;
+    return QStandardPaths::findExecutable(exeName);
 }
 
 bool VectorConverter::hasPdftocairo() const
 {
     return !findTool("pdftocairo").isEmpty();
-}
-
-bool VectorConverter::hasPotrace() const
-{
-    return !findTool("potrace").isEmpty();
-}
-
-bool VectorConverter::hasAutotrace() const
-{
-    return !findTool("autotrace").isEmpty();
 }
 
 void VectorConverter::cancel()
@@ -69,13 +58,11 @@ bool VectorConverter::runPdftocairo(const QString &pdfPath,
     }
 
     QStringList args;
-    args << "-svg";                    // SVG output (vector-preserving)
+    args << "-svg";
     args << "-f" << QString::number(firstPage);
     args << "-l" << QString::number(lastPage);
-    // Note: -singlefile is NOT supported with -svg output.
-    // pdftocairo adds .svg extension to the output path.
     args << pdfPath;
-    args << outputPath;                // Output base (pdftocairo appends .svg)
+    args << outputPath;
 
     QProcess proc;
     proc.setProcessChannelMode(QProcess::MergedChannels);
@@ -90,18 +77,14 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
 {
     m_cancelled = false;
 
-    QString tool = findTool("pdftocairo");
-    if (tool.isEmpty()) {
-        emit fileDone(fileIndex, false, 0,
-                       "pdftocairo not found. Install Poppler and ensure it's on PATH, "
-                       "or bundle it with the app.");
+    if (!hasPdftocairo()) {
+        emit fileDone(fileIndex, false, 0, 0, "pdftocairo not found");
         return;
     }
 
-    // Get page count via QPdfDocument
     int totalPages = PdfConverter::getPageCount(pdfPath);
     if (totalPages == 0) {
-        emit fileDone(fileIndex, false, 0, "Failed to open PDF");
+        emit fileDone(fileIndex, false, 0, 0, "Failed to open PDF");
         return;
     }
 
@@ -117,13 +100,13 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
     QDir().mkpath(outDir);
 
     int pagesWritten = 0;
+    int pagesFailed = 0;
 
     if (opts.splitPages) {
-        // One SVG per page
         int pagesTotal = pages.size();
         for (int i = 0; i < pagesTotal; ++i) {
             if (m_cancelled) {
-                emit fileDone(fileIndex, false, pagesWritten, "Cancelled");
+                emit fileDone(fileIndex, false, pagesWritten, pagesFailed, "Cancelled");
                 return;
             }
 
@@ -138,21 +121,19 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
                 continue;
             }
 
-            // pdftocairo -svg does NOT add .svg extension, so pass the full path
             if (runPdftocairo(pdfPath, outPath, pageIdx + 1, pageIdx + 1)) {
                 pagesWritten++;
             } else {
-                qWarning() << "pdftocairo failed for page" << pageIdx;
+                pagesFailed++;
             }
 
             int percent = static_cast<int>((i + 1) * 100.0 / pagesTotal);
             emit pageProgress(fileIndex, i, pagesTotal, percent);
         }
     } else {
-        // All pages in one SVG
         QString outPath = QDir(outDir).absoluteFilePath(baseName + ".svg");
         if (!opts.overwrite && QFileInfo::exists(outPath)) {
-            emit fileDone(fileIndex, true, 0, "Skipped (exists)");
+            emit fileDone(fileIndex, true, 0, 0, "Skipped (exists)");
             return;
         }
 
@@ -161,12 +142,16 @@ void VectorConverter::convertPdfToSvg(const QString &pdfPath,
 
         if (runPdftocairo(pdfPath, outPath, firstPage, lastPage)) {
             pagesWritten = pages.size();
+        } else {
+            pagesFailed = pages.size();
         }
     }
 
-    emit fileDone(fileIndex, pagesWritten > 0, pagesWritten,
-                   QString("Converted %1 → %2 SVG pages")
-                       .arg(fi.fileName()).arg(pagesWritten));
+    bool success = (pagesFailed == 0);
+    QString msg = QString("Converted %1 → %2 SVG pages%3")
+                      .arg(fi.fileName()).arg(pagesWritten)
+                      .arg(pagesFailed > 0 ? QString(" (%1 failed)").arg(pagesFailed) : "");
+    emit fileDone(fileIndex, success, pagesWritten, pagesFailed, msg);
 }
 
 void VectorConverter::convertPdfToDxf(const QString &pdfPath,
@@ -175,19 +160,14 @@ void VectorConverter::convertPdfToDxf(const QString &pdfPath,
 {
     m_cancelled = false;
 
-    // Pipeline: PDF → SVG (pdftocairo) → DXF (custom parser)
-    // Step 1: Convert PDF to SVG (reuse the SVG conversion)
-    // Step 2: Parse SVG paths and write DXF
-
-    QString tool = findTool("pdftocairo");
-    if (tool.isEmpty()) {
-        emit fileDone(fileIndex, false, 0, "pdftocairo not found");
+    if (!hasPdftocairo()) {
+        emit fileDone(fileIndex, false, 0, 0, "pdftocairo not found");
         return;
     }
 
     int totalPages = PdfConverter::getPageCount(pdfPath);
     if (totalPages == 0) {
-        emit fileDone(fileIndex, false, 0, "Failed to open PDF");
+        emit fileDone(fileIndex, false, 0, 0, "Failed to open PDF");
         return;
     }
 
@@ -203,19 +183,19 @@ void VectorConverter::convertPdfToDxf(const QString &pdfPath,
     QDir().mkpath(outDir);
 
     int pagesWritten = 0;
+    int pagesFailed = 0;
     int pagesTotal = pages.size();
 
     for (int i = 0; i < pagesTotal; ++i) {
         if (m_cancelled) {
-            emit fileDone(fileIndex, false, pagesWritten, "Cancelled");
+            emit fileDone(fileIndex, false, pagesWritten, pagesFailed, "Cancelled");
             return;
         }
 
         int pageIdx = pages[i];
 
-        // Generate temp SVG via pdftocairo
         QString outName = baseName;
-        if (opts.splitPages) {
+        if (totalPages > 1) {
             int digits = qMax(2, QString::number(totalPages).length());
             outName += "_p" + QString::number(pageIdx + 1).rightJustified(digits, '0');
         }
@@ -227,80 +207,104 @@ void VectorConverter::convertPdfToDxf(const QString &pdfPath,
             continue;
         }
 
-        // Create temp SVG
         QString tempSvg = QDir::temp().absoluteFilePath(
-            QString("ecs_pdf_%1_%2.svg").arg(fi.baseName()).arg(pageIdx));
+            QString("ecs_pdf_%1_%2_%3.svg").arg(fi.completeBaseName())
+                                           .arg(pageIdx)
+                                           .arg(QCoreApplication::applicationPid()));
 
         if (!runPdftocairo(pdfPath, tempSvg, pageIdx + 1, pageIdx + 1)) {
-            qWarning() << "pdftocairo failed for page" << pageIdx;
+            pagesFailed++;
+            QFile::remove(tempSvg);
             continue;
         }
 
-        // Convert SVG → DXF
         if (svgToDxf(tempSvg, dxfPath)) {
             pagesWritten++;
         } else {
-            qWarning() << "SVG→DXF conversion failed for" << tempSvg;
+            pagesFailed++;
         }
 
-        // Clean up temp SVG
         QFile::remove(tempSvg);
 
         int percent = static_cast<int>((i + 1) * 100.0 / pagesTotal);
         emit pageProgress(fileIndex, i, pagesTotal, percent);
     }
 
-    emit fileDone(fileIndex, pagesWritten > 0, pagesWritten,
-                   QString("Converted %1 → %2 DXF pages")
-                       .arg(fi.fileName()).arg(pagesWritten));
-}
-
-void VectorConverter::convertImageToSvg(const QString &imagePath,
-                                         const QString &outputPath,
-                                         bool colorTrace)
-{
-    Q_UNUSED(colorTrace)
-
-    // Choose tool: autotrace for color, potrace for B&W
-    QString tool = colorTrace ? findTool("autotrace") : findTool("potrace");
-    if (tool.isEmpty()) {
-        qWarning() << "No tracing tool found";
-        return;
-    }
-
-    QStringList args;
-    if (colorTrace) {
-        // autotrace -output-format svg input.png > output.svg
-        args << "-output-format" << "svg" << imagePath;
-    } else {
-        // potrace -b svg -o output.svg input.pbm
-        args << "-b" << "svg" << "-o" << outputPath << imagePath;
-    }
-
-    QProcess proc;
-    if (colorTrace) {
-        // autotrace writes to stdout
-        proc.setStandardOutputFile(outputPath);
-        proc.start(tool, args);
-        proc.waitForFinished(30000);
-    } else {
-        int exitCode = proc.execute(tool, args);
-        if (exitCode != 0) {
-            qWarning() << "potrace failed with code" << exitCode;
-        }
-    }
+    bool success = (pagesFailed == 0);
+    QString msg = QString("Converted %1 → %2 DXF pages%3")
+                      .arg(fi.fileName()).arg(pagesWritten)
+                      .arg(pagesFailed > 0 ? QString(" (%1 failed)").arg(pagesFailed) : "");
+    emit fileDone(fileIndex, success, pagesWritten, pagesFailed, msg);
 }
 
 // ── SVG → DXF conversion ────────────────────────────────────────────
-
-// Parse SVG path data "d" attribute and extract polyline points.
-// This is a simplified parser that handles the most common path commands:
-// M (moveto), L (lineto), H, V, C (cubic bezier → tessellated), Z (closepath)
 
 struct SvgPath {
     QList<QPointF> points;
     bool closed = false;
 };
+
+// Tessellate a cubic bezier into line segments
+static void tessellateCubic(QList<QPointF> &out,
+                             QPointF p0, QPointF p1, QPointF p2, QPointF p3,
+                             int steps = 16)
+{
+    for (int i = 1; i <= steps; ++i) {
+        double t = static_cast<double>(i) / steps;
+        double u = 1.0 - t;
+        double x = u*u*u * p0.x() + 3*u*u*t * p1.x() + 3*u*t*t * p2.x() + t*t*t * p3.x();
+        double y = u*u*u * p0.y() + 3*u*u*t * p1.y() + 3*u*t*t * p2.y() + t*t*t * p3.y();
+        out.append(QPointF(x, y));
+    }
+}
+
+// Tessellate a quadratic bezier into line segments
+static void tessellateQuadratic(QList<QPointF> &out,
+                                 QPointF p0, QPointF p1, QPointF p2,
+                                 int steps = 16)
+{
+    for (int i = 1; i <= steps; ++i) {
+        double t = static_cast<double>(i) / steps;
+        double u = 1.0 - t;
+        double x = u*u * p0.x() + 2*u*t * p1.x() + t*t * p2.x();
+        double y = u*u * p0.y() + 2*u*t * p1.y() + t*t * p2.y();
+        out.append(QPointF(x, y));
+    }
+}
+
+// Tokenize SVG path data into commands and numbers
+struct SvgToken {
+    bool isCommand;
+    QChar cmd;
+    double value;
+};
+
+static QList<SvgToken> tokenizeSvgPath(const QString &d)
+{
+    QList<SvgToken> tokens;
+    QRegularExpression rx("([MLHVCSQTAZmlhvcsqtaz])|(-?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?)");
+    auto it = rx.globalMatch(d);
+    while (it.hasNext()) {
+        auto m = it.next();
+        QString tok = m.captured(0);
+        if (tok[0].isLetter()) {
+            tokens.append({true, tok[0], 0.0});
+        } else {
+            tokens.append({false, QChar(), tok.toDouble()});
+        }
+    }
+    return tokens;
+}
+
+// Helper: read next number from token list at given index
+static double nextNum(const QList<SvgToken> &tokens, int &idx)
+{
+    while (idx < tokens.size() && tokens[idx].isCommand)
+        idx++;
+    if (idx >= tokens.size())
+        return 0.0;
+    return tokens[idx++].value;
+}
 
 static QList<SvgPath> parseSvgPathData(const QString &d)
 {
@@ -308,104 +312,131 @@ static QList<SvgPath> parseSvgPathData(const QString &d)
     SvgPath current;
     bool first = true;
 
-    QRegularExpression rx("([MLHVCSQTAZmlhvcsqtaz])|(-?\\d+\\.?\\d*(?:[eE][-+]?\\d+)?)");
-    auto it = rx.globalMatch(d);
+    QList<SvgToken> tokens = tokenizeSvgPath(d);
+    int idx = 0;
 
-    QChar lastCmd;
     QPointF lastPoint;
+    QPointF lastControl;
 
-    while (it.hasNext()) {
-        auto m = it.next();
-        QString tok = m.captured(0);
+    while (idx < tokens.size()) {
+        if (!tokens[idx].isCommand) {
+            idx++;
+            continue;
+        }
 
-        if (tok[0].isLetter()) {
-            QChar cmd = tok[0];
-            lastCmd = cmd;
+        QChar cmd = tokens[idx++].cmd;
 
-            if (cmd == 'M' || cmd == 'm') {
-                if (!first && !current.points.isEmpty()) {
-                    paths.append(current);
-                    current = SvgPath();
-                }
-                first = false;
-
-                // Next token is the first coordinate
-                if (it.hasNext()) {
-                    auto m2 = it.next();
-                    double x = m2.captured(0).toDouble();
-                    if (it.hasNext()) {
-                        auto m3 = it.next();
-                        double y = m3.captured(0).toDouble();
-                        if (cmd == 'm' && !current.points.isEmpty()) {
-                            x += lastPoint.x();
-                            y += lastPoint.y();
-                        }
-                        current.points.append(QPointF(x, y));
-                        lastPoint = QPointF(x, y);
-                    }
-                }
-            } else if (cmd == 'L' || cmd == 'l') {
-                if (it.hasNext()) {
-                    double x = it.next().captured(0).toDouble();
-                    if (it.hasNext()) {
-                        double y = it.next().captured(0).toDouble();
-                        if (cmd == 'l') {
-                            x += lastPoint.x();
-                            y += lastPoint.y();
-                        }
-                        current.points.append(QPointF(x, y));
-                        lastPoint = QPointF(x, y);
-                    }
-                }
-            } else if (cmd == 'H' || cmd == 'h') {
-                if (it.hasNext()) {
-                    double x = it.next().captured(0).toDouble();
-                    if (cmd == 'h') x += lastPoint.x();
-                    current.points.append(QPointF(x, lastPoint.y()));
-                    lastPoint = QPointF(x, lastPoint.y());
-                }
-            } else if (cmd == 'V' || cmd == 'v') {
-                if (it.hasNext()) {
-                    double y = it.next().captured(0).toDouble();
-                    if (cmd == 'v') y += lastPoint.y();
-                    current.points.append(QPointF(lastPoint.x(), y));
-                    lastPoint = QPointF(lastPoint.x(), y);
-                }
-            } else if (cmd == 'C' || cmd == 'c') {
-                // Cubic bezier: 6 coordinates (3 control points + end point)
-                // Tessellate into line segments
-                if (cmd == 'C') {
-                    for (int j = 0; j < 3 && it.hasNext(); j++) {
-                        double x = it.next().captured(0).toDouble();
-                        if (it.hasNext()) {
-                            double y = it.next().captured(0).toDouble();
-                            // Skip control points, just use the endpoint
-                            if (j == 2) {
-                                current.points.append(QPointF(x, y));
-                                lastPoint = QPointF(x, y);
-                            }
-                        }
-                    }
-                } else {
-                    for (int j = 0; j < 3 && it.hasNext(); j++) {
-                        double x = it.next().captured(0).toDouble();
-                        if (it.hasNext()) {
-                            double y = it.next().captured(0).toDouble();
-                            if (j == 2) {
-                                x += lastPoint.x();
-                                y += lastPoint.y();
-                                current.points.append(QPointF(x, y));
-                                lastPoint = QPointF(x, y);
-                            }
-                        }
-                    }
-                }
-            } else if (cmd == 'Z' || cmd == 'z') {
-                current.closed = true;
+        if (cmd == 'M' || cmd == 'm') {
+            if (!first && !current.points.isEmpty()) {
                 paths.append(current);
                 current = SvgPath();
-                first = true;
             }
+            first = false;
+
+            double x = nextNum(tokens, idx);
+            double y = nextNum(tokens, idx);
+            if (cmd == 'm' && !current.points.isEmpty()) {
+                x += lastPoint.x();
+                y += lastPoint.y();
+            }
+            current.points.append(QPointF(x, y));
+            lastPoint = QPointF(x, y);
+
+            // Implicit L: subsequent coordinate pairs are lineto
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                x = nextNum(tokens, idx);
+                y = nextNum(tokens, idx);
+                if (cmd == 'm') { x += lastPoint.x(); y += lastPoint.y(); }
+                current.points.append(QPointF(x, y));
+                lastPoint = QPointF(x, y);
+            }
+        } else if (cmd == 'L' || cmd == 'l') {
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x = nextNum(tokens, idx);
+                double y = nextNum(tokens, idx);
+                if (cmd == 'l') { x += lastPoint.x(); y += lastPoint.y(); }
+                current.points.append(QPointF(x, y));
+                lastPoint = QPointF(x, y);
+            }
+        } else if (cmd == 'H' || cmd == 'h') {
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x = nextNum(tokens, idx);
+                if (cmd == 'h') x += lastPoint.x();
+                current.points.append(QPointF(x, lastPoint.y()));
+                lastPoint = QPointF(x, lastPoint.y());
+            }
+        } else if (cmd == 'V' || cmd == 'v') {
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double y = nextNum(tokens, idx);
+                if (cmd == 'v') y += lastPoint.y();
+                current.points.append(QPointF(lastPoint.x(), y));
+                lastPoint = QPointF(lastPoint.x(), y);
+            }
+        } else if (cmd == 'C' || cmd == 'c') {
+            QPointF p0 = lastPoint;
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x1 = nextNum(tokens, idx), y1 = nextNum(tokens, idx);
+                double x2 = nextNum(tokens, idx), y2 = nextNum(tokens, idx);
+                double x3 = nextNum(tokens, idx), y3 = nextNum(tokens, idx);
+                QPointF p1(x1, y1), p2(x2, y2), p3(x3, y3);
+                if (cmd == 'c') { p1 += lastPoint; p2 += lastPoint; p3 += lastPoint; }
+                tessellateCubic(current.points, p0, p1, p2, p3);
+                lastPoint = p3;
+                lastControl = p2;
+                p0 = p3;
+            }
+        } else if (cmd == 'S' || cmd == 's') {
+            QPointF p0 = lastPoint;
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x2 = nextNum(tokens, idx), y2 = nextNum(tokens, idx);
+                double x3 = nextNum(tokens, idx), y3 = nextNum(tokens, idx);
+                QPointF p2(x2, y2), p3(x3, y3);
+                if (cmd == 's') { p2 += lastPoint; p3 += lastPoint; }
+                QPointF p1(2*lastPoint.x() - lastControl.x(), 2*lastPoint.y() - lastControl.y());
+                tessellateCubic(current.points, p0, p1, p2, p3);
+                lastPoint = p3;
+                lastControl = p2;
+                p0 = p3;
+            }
+        } else if (cmd == 'Q' || cmd == 'q') {
+            QPointF p0 = lastPoint;
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x1 = nextNum(tokens, idx), y1 = nextNum(tokens, idx);
+                double x2 = nextNum(tokens, idx), y2 = nextNum(tokens, idx);
+                QPointF p1(x1, y1), p2(x2, y2);
+                if (cmd == 'q') { p1 += lastPoint; p2 += lastPoint; }
+                tessellateQuadratic(current.points, p0, p1, p2);
+                lastPoint = p2;
+                lastControl = p1;
+                p0 = p2;
+            }
+        } else if (cmd == 'T' || cmd == 't') {
+            QPointF p0 = lastPoint;
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                double x2 = nextNum(tokens, idx), y2 = nextNum(tokens, idx);
+                QPointF p2(x2, y2);
+                if (cmd == 't') p2 += lastPoint;
+                QPointF p1(2*lastPoint.x() - lastControl.x(), 2*lastPoint.y() - lastControl.y());
+                tessellateQuadratic(current.points, p0, p1, p2);
+                lastPoint = p2;
+                lastControl = p1;
+                p0 = p2;
+            }
+        } else if (cmd == 'A' || cmd == 'a') {
+            // Elliptical arc: 7 params — approximate as line to endpoint
+            while (idx < tokens.size() && !tokens[idx].isCommand) {
+                // Skip rx, ry, rotation, large-arc-flag, sweep-flag (5 params)
+                for (int j = 0; j < 5; j++) nextNum(tokens, idx);
+                double x = nextNum(tokens, idx), y = nextNum(tokens, idx);
+                if (cmd == 'a') { x += lastPoint.x(); y += lastPoint.y(); }
+                current.points.append(QPointF(x, y));
+                lastPoint = QPointF(x, y);
+            }
+        } else if (cmd == 'Z' || cmd == 'z') {
+            current.closed = true;
+            paths.append(current);
+            current = SvgPath();
+            first = true;
         }
     }
 
@@ -423,6 +454,7 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
 
     QXmlStreamReader xml(&file);
     QList<QList<QPointF>> allPolylines;
+    QList<bool> allClosed;
     double svgWidth = 0, svgHeight = 0;
 
     while (!xml.atEnd()) {
@@ -430,7 +462,6 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
 
         if (xml.isStartElement()) {
             if (xml.name() == "svg") {
-                // Get viewBox or width/height
                 QStringView w = xml.attributes().value("width");
                 QStringView h = xml.attributes().value("height");
                 QStringView vb = xml.attributes().value("viewBox");
@@ -441,16 +472,18 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
                         svgHeight = parts[3].toDouble();
                     }
                 } else {
-                    svgWidth = w.toString().remove("pt").toDouble();
-                    svgHeight = h.toString().remove("pt").toDouble();
+                    svgWidth = w.toString().remove(QRegularExpression("[a-zA-Z%]")).toDouble();
+                    svgHeight = h.toString().remove(QRegularExpression("[a-zA-Z%]")).toDouble();
                 }
             } else if (xml.name() == "path") {
                 QString d = xml.attributes().value("d").toString();
                 if (!d.isEmpty()) {
                     QList<SvgPath> paths = parseSvgPathData(d);
                     for (const auto &p : paths) {
-                        if (p.points.size() >= 2)
+                        if (p.points.size() >= 2) {
                             allPolylines.append(p.points);
+                            allClosed.append(p.closed);
+                        }
                     }
                 }
             } else if (xml.name() == "line") {
@@ -462,6 +495,7 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
                 line.append(QPointF(x1, y1));
                 line.append(QPointF(x2, y2));
                 allPolylines.append(line);
+                allClosed.append(false);
             } else if (xml.name() == "rect") {
                 double x = xml.attributes().value("x").toDouble();
                 double y = xml.attributes().value("y").toDouble();
@@ -471,6 +505,7 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
                 rect << QPointF(x, y) << QPointF(x+w, y) << QPointF(x+w, y+h)
                      << QPointF(x, y+h) << QPointF(x, y);
                 allPolylines.append(rect);
+                allClosed.append(true);
             }
         }
     }
@@ -483,15 +518,16 @@ bool VectorConverter::svgToDxf(const QString &svgPath, const QString &dxfPath)
     file.close();
 
     if (allPolylines.isEmpty()) {
-        // No vector content found — write empty DXF
-        qWarning() << "No vector paths found in SVG";
+        qWarning() << "No vector paths found in SVG — not writing empty DXF";
+        return false;
     }
 
-    return writeDxf(dxfPath, allPolylines, svgWidth, svgHeight);
+    return writeDxf(dxfPath, allPolylines, allClosed, svgWidth, svgHeight);
 }
 
 bool VectorConverter::writeDxf(const QString &path,
                                 const QList<QList<QPointF>> &polylines,
+                                const QList<bool> &closedFlags,
                                 double width, double height)
 {
     QFile file(path);
@@ -502,42 +538,36 @@ bool VectorConverter::writeDxf(const QString &path,
     out.setRealNumberNotation(QTextStream::FixedNotation);
     out.setRealNumberPrecision(6);
 
-    // DXF R2000 minimal file structure
-    // Sections: HEADER, TABLES, BLOCKS, ENTITIES, EOF
-
-    // ── HEADER section ──────────────────────────────────────
     out << "0\nSECTION\n";
     out << "2\nHEADER\n";
     out << "9\n$ACADVER\n";
-    out << "1\nAC1015\n";        // AutoCAD 2000
+    out << "1\nAC1015\n";
     out << "9\n$INSBASE\n";
     out << "10\n0.0\n20\n0.0\n30\n0.0\n";
     out << "0\nENDSEC\n";
 
-    // ── TABLES section (minimal) ────────────────────────────
     out << "0\nSECTION\n2\nTABLES\n";
     out << "0\nTABLE\n2\nLAYER\n70\n1\n";
     out << "0\nLAYER\n2\n0\n70\n0\n62\n7\n6\nCONTINUOUS\n";
     out << "0\nENDTAB\n0\nENDSEC\n";
 
-    // ── BLOCKS section (empty) ──────────────────────────────
     out << "0\nSECTION\n2\nBLOCKS\n0\nENDSEC\n";
 
-    // ── ENTITIES section ────────────────────────────────────
     out << "0\nSECTION\n2\nENTITIES\n";
 
-    // Flip Y axis: SVG is top-down, DXF is bottom-up
     double flipY = (height > 0) ? height : 1000.0;
 
-    for (const auto &poly : polylines) {
+    for (int i = 0; i < polylines.size(); ++i) {
+        const auto &poly = polylines[i];
         if (poly.size() < 2)
             continue;
 
-        // Write as LWPOLYLINE
+        bool closed = (i < closedFlags.size()) ? closedFlags[i] : false;
+
         out << "0\nLWPOLYLINE\n";
-        out << "8\n0\n";          // Layer 0
-        out << "90\n" << poly.size() << "\n";    // Vertex count
-        out << "70\n0\n";         // Open polyline
+        out << "8\n0\n";
+        out << "90\n" << poly.size() << "\n";
+        out << "70\n" << (closed ? 1 : 0) << "\n";
 
         for (const QPointF &pt : poly) {
             out << "10\n" << pt.x() << "\n";
@@ -546,8 +576,6 @@ bool VectorConverter::writeDxf(const QString &path,
     }
 
     out << "0\nENDSEC\n";
-
-    // ── EOF ─────────────────────────────────────────────────
     out << "0\nEOF\n";
 
     file.close();

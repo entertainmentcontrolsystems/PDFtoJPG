@@ -24,9 +24,10 @@
 #include <QDebug>
 #include <QGroupBox>
 #include <QStandardPaths>
-#include <QThread>
+#include <QtConcurrent>
+#include <QFutureWatcher>
 
-// ── Custom drop area widget (just forwards to parent) ─────────────────
+// ── Custom drop area widget ─────────────────────────────────────────
 class QDropArea : public QWidget {
 public:
     explicit QDropArea(QWidget *parent = nullptr) : QWidget(parent) {
@@ -98,7 +99,7 @@ void MainWindow::buildUi()
     m_dropArea = new QDropArea;
     auto *dropLayout = new QVBoxLayout(m_dropArea);
     dropLayout->setAlignment(Qt::AlignCenter);
-    auto *dropLabel = new QLabel("📎 Drop PDF files or a folder here\nor click \"Add Files\"");
+    auto *dropLabel = new QLabel("Drop PDF files or a folder here\nor click \"Add Files\"");
     dropLabel->setAlignment(Qt::AlignCenter);
     dropLabel->setStyleSheet("font-size: 13px; color: gray;");
     dropLayout->addWidget(dropLabel);
@@ -128,7 +129,6 @@ void MainWindow::buildUi()
     fileBtnRow->addWidget(m_fileCountLabel);
     sourceLayout->addLayout(fileBtnRow);
 
-    // File list
     m_fileList = new QListWidget;
     m_fileList->setMaximumHeight(140);
     sourceLayout->addWidget(m_fileList);
@@ -140,7 +140,6 @@ void MainWindow::buildUi()
     auto *outputLayout = new QGridLayout(outputGroup);
     outputLayout->setSpacing(10);
     outputLayout->setContentsMargins(12, 10, 12, 10);
-    // Give column 1 plenty of room so dropdowns/spinboxes don't clip
     outputLayout->setColumnMinimumWidth(1, 280);
     outputLayout->setColumnStretch(1, 1);
 
@@ -153,7 +152,7 @@ void MainWindow::buildUi()
     outputLayout->addWidget(m_outputEdit, 0, 1);
     outputLayout->addWidget(m_outputBtn, 0, 2);
 
-    // Format
+    // Format — SVG_Traced removed (C1 fix: dead path, never implemented)
     outputLayout->addWidget(new QLabel("Format:"), 1, 0);
     m_formatCombo = new QComboBox;
     m_formatCombo->setMinimumWidth(300);
@@ -165,14 +164,14 @@ void MainWindow::buildUi()
     m_formatCombo->addItem("BMP", static_cast<int>(OutputFormat::BMP));
     m_formatCombo->insertSeparator(m_formatCombo->count());
     m_formatCombo->addItem("SVG (Vector — preserve geometry)", static_cast<int>(OutputFormat::SVG_Vector));
-    m_formatCombo->addItem("SVG (Traced — from raster)", static_cast<int>(OutputFormat::SVG_Traced));
     m_formatCombo->addItem("DXF (CAD)", static_cast<int>(OutputFormat::DXF));
     connect(m_formatCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onFormatChanged);
     outputLayout->addWidget(m_formatCombo, 1, 1, 1, 2);
 
     // DPI
-    outputLayout->addWidget(new QLabel("DPI:"), 2, 0);
+    m_dpiLabel = new QLabel("DPI:");
+    outputLayout->addWidget(m_dpiLabel, 2, 0);
     m_dpiSpin = new QSpinBox;
     m_dpiSpin->setRange(72, 600);
     m_dpiSpin->setValue(150);
@@ -181,7 +180,8 @@ void MainWindow::buildUi()
     outputLayout->addWidget(m_dpiSpin, 2, 1);
 
     // Quality
-    outputLayout->addWidget(new QLabel("Quality:"), 3, 0);
+    m_qualityLabel = new QLabel("Quality:");
+    outputLayout->addWidget(m_qualityLabel, 3, 0);
     m_qualitySpin = new QSpinBox;
     m_qualitySpin->setRange(1, 100);
     m_qualitySpin->setValue(90);
@@ -305,15 +305,14 @@ void MainWindow::onClearFiles()
 
 void MainWindow::onFormatChanged(int index)
 {
-    auto fmt = static_cast<OutputFormat>(m_formatCombo->itemData(index).toInt());
+    auto fmt = static_cast<OutputFormat>(m_formatCombo->currentData().toInt());
 
-    // Enable/disable raster-specific options
+    // M4 fix: Hide DPI/Quality for vector formats instead of just disabling
     bool isRaster = PdfConverter::isRaster(fmt);
-    m_dpiSpin->setEnabled(isRaster);
-    m_qualitySpin->setEnabled(isRaster && (fmt == OutputFormat::JPEG || fmt == OutputFormat::WebP));
-
-    // DPI label says "Render DPI" for raster, "N/A" for vector
-    // (Vector PDF→SVG preserves original PDF resolution)
+    m_dpiSpin->setVisible(isRaster);
+    m_dpiLabel->setVisible(isRaster);
+    m_qualitySpin->setVisible(isRaster && (fmt == OutputFormat::JPEG || fmt == OutputFormat::WebP));
+    m_qualityLabel->setVisible(isRaster && (fmt == OutputFormat::JPEG || fmt == OutputFormat::WebP));
 }
 
 void MainWindow::scanPdfs(const QString &path)
@@ -326,7 +325,6 @@ void MainWindow::scanPdfs(const QString &path)
             m_pdfFiles.append(absPath);
     }
 
-    // Recursive scan of subdirectories
     auto subdirs = dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Readable);
     for (const QFileInfo &subdir : subdirs) {
         scanPdfs(subdir.absoluteFilePath());
@@ -372,22 +370,24 @@ void MainWindow::onConvert()
                 "Set an output folder or check \"Save to same folder as source\".");
             return;
         }
-        QDir().mkpath(opts.outputDir);
+        if (!QDir().mkpath(opts.outputDir)) {
+            QMessageBox::critical(this, "Error",
+                "Failed to create output directory: " + opts.outputDir);
+            return;
+        }
     }
 
     // Check vector tool availability
     if (fmt == OutputFormat::SVG_Vector || fmt == OutputFormat::DXF) {
         if (!m_vectorConverter->hasPdftocairo()) {
-            int ret = QMessageBox::warning(this, "Tool Not Found",
+            QMessageBox::warning(this, "Tool Not Found",
                 "pdftocairo (from Poppler) was not found.\n\n"
                 "This tool is required for vector PDF → SVG/DXF conversion.\n\n"
                 "Install Poppler:\n"
                 "  macOS: brew install poppler\n"
-                "  Windows: download from https://github.com/oschwartz10612/poppler-windows/releases\n\n"
-                "Or bundle it in the 'tools/' folder next to the app.\n\n"
-                "Continue with raster-only conversion instead?");
-            if (ret == QMessageBox::Cancel)
-                return;
+                "  Windows: download from poppler-windows releases on GitHub\n\n"
+                "Or bundle it in the 'tools/' folder next to the app.");
+            return;
         }
     }
 
@@ -395,54 +395,61 @@ void MainWindow::onConvert()
     m_totalFilesConverted = 0;
     m_totalErrors = 0;
     m_totalPagesRendered = 0;
+    m_totalPagesFailed = 0;
     setControlsEnabled(false);
     m_progressBar->setVisible(true);
     m_progressBar->setRange(0, m_pdfFiles.size() * 100);
     m_progressBar->setValue(0);
     m_statusLabel->setText("Converting...");
 
-    // Run conversion in a worker thread
-    auto *thread = new QThread;
-    auto *worker = new QObject;  // dummy
-
-    // We'll process files sequentially using QtConcurrent
+    // C2 fix: Run conversion in a worker thread using QtConcurrent
+    // Capture copies for the lambda
     int totalFiles = m_pdfFiles.size();
+    PdfConverter *raster = m_rasterConverter;
+    VectorConverter *vector = m_vectorConverter;
 
-    // Process each file
-    for (int i = 0; i < totalFiles; ++i) {
-        const QString &pdfPath = m_pdfFiles[i];
+    m_futureWatcher = new QFutureWatcher<void>(this);
+    connect(m_futureWatcher, &QFutureWatcher<void>::finished, this, [this]() {
+        ConversionResult result;
+        result.success = (m_totalErrors == 0);
+        result.filesProcessed = m_totalFilesConverted;
+        result.pagesRendered = m_totalPagesRendered;
+        result.pagesFailed = m_totalPagesFailed;
+        result.errors = m_totalErrors;
+        onAllDone(result);
+        m_futureWatcher->deleteLater();
+        m_futureWatcher = nullptr;
+    });
 
-        if (PdfConverter::isRaster(fmt)) {
-            m_rasterConverter->convertToRaster(pdfPath, opts, i, totalFiles);
-        } else if (fmt == OutputFormat::SVG_Vector) {
-            m_vectorConverter->convertPdfToSvg(pdfPath, opts, i, totalFiles);
-        } else if (fmt == OutputFormat::DXF) {
-            m_vectorConverter->convertPdfToDxf(pdfPath, opts, i, totalFiles);
-        } else if (fmt == OutputFormat::SVG_Traced) {
-            // For traced SVG: render to image first, then trace
-            // This uses raster pipeline + potrace
-            // For now, use raster render then trace
-            m_rasterConverter->convertToRaster(pdfPath, opts, i, totalFiles);
+    auto future = QtConcurrent::run([=]() {
+        for (int i = 0; i < totalFiles; ++i) {
+            const QString &pdfPath = m_pdfFiles[i];
+
+            if (PdfConverter::isRaster(fmt)) {
+                raster->convertToRaster(pdfPath, opts, i, totalFiles);
+            } else if (fmt == OutputFormat::SVG_Vector) {
+                vector->convertPdfToSvg(pdfPath, opts, i, totalFiles);
+            } else if (fmt == OutputFormat::DXF) {
+                vector->convertPdfToDxf(pdfPath, opts, i, totalFiles);
+            }
         }
-    }
+    });
 
-    // All files processed (synchronous for now — will move to async)
-    ConversionResult result;
-    result.success = m_totalErrors == 0;
-    result.filesProcessed = m_totalFilesConverted;
-    result.pagesRendered = m_totalPagesRendered;
-    result.errors = m_totalErrors;
-    onAllDone(result);
+    m_futureWatcher->setFuture(future);
 }
 
 void MainWindow::onCancel()
 {
     m_rasterConverter->cancel();
     m_vectorConverter->cancel();
+    m_statusLabel->setText("Cancelling...");
 }
 
 void MainWindow::onPageProgress(int fileIndex, int pageIndex, int totalPages, int percent)
 {
+    if (fileIndex < 0 || fileIndex >= m_pdfFiles.size())
+        return;  // L1 fix: bounds check
+
     int overall = fileIndex * 100 + percent;
     m_progressBar->setValue(overall);
 
@@ -456,16 +463,17 @@ void MainWindow::onPageProgress(int fileIndex, int pageIndex, int totalPages, in
         .arg(percent));
 }
 
-void MainWindow::onFileDone(int fileIndex, bool success, int pagesWritten, const QString &message)
+void MainWindow::onFileDone(int fileIndex, bool success, int pagesWritten, int pagesFailed, const QString &message)
 {
     if (success)
         m_totalFilesConverted++;
     else
         m_totalErrors++;
     m_totalPagesRendered += pagesWritten;
+    m_totalPagesFailed += pagesFailed;
 
     // Update file list item
-    if (fileIndex < m_fileList->count()) {
+    if (fileIndex >= 0 && fileIndex < m_fileList->count()) {
         QString text = m_fileList->item(fileIndex)->text();
         m_fileList->item(fileIndex)->setText(text + "  →  " + (success ? "✓" : "✗") + " " + message);
     }
@@ -478,27 +486,30 @@ void MainWindow::onAllDone(const ConversionResult &result)
     m_progressBar->setVisible(false);
 
     QString summary;
-    if (result.errors == 0) {
+    if (result.errors == 0 && result.pagesFailed == 0) {
         summary = QString("Done — %1 file(s) converted, %2 pages written.")
                       .arg(result.filesProcessed)
                       .arg(result.pagesRendered);
         m_statusLabel->setText(summary);
         m_statusLabel->setStyleSheet("color: green; font-size: 11px;");
     } else {
-        summary = QString("Done — %1 file(s) converted, %2 pages, %3 error(s).")
+        summary = QString("Done — %1 file(s) converted, %2 pages, %3 failed, %4 error(s).")
                       .arg(result.filesProcessed)
                       .arg(result.pagesRendered)
+                      .arg(result.pagesFailed)
                       .arg(result.errors);
         m_statusLabel->setText(summary);
         m_statusLabel->setStyleSheet("color: darkorange; font-size: 11px;");
     }
 
     // Open output folder
-    if (result.errors == 0 && m_openWhenDoneCheck->isChecked()) {
-        QString outDir = m_sameFolderCheck->isChecked()
-            ? QFileInfo(m_pdfFiles.first()).absolutePath()
-            : m_outputEdit->text();
-        QDesktopServices::openUrl(QUrl::fromLocalFile(outDir));
+    if (result.errors == 0 && result.pagesFailed == 0 && m_openWhenDoneCheck->isChecked()) {
+        if (!m_pdfFiles.isEmpty()) {
+            QString outDir = m_sameFolderCheck->isChecked()
+                ? QFileInfo(m_pdfFiles.first()).absolutePath()
+                : m_outputEdit->text();
+            QDesktopServices::openUrl(QUrl::fromLocalFile(outDir));
+        }
     }
 }
 
